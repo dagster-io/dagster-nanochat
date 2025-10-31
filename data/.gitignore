@@ -1,0 +1,18 @@
+# Raw parquet files
+*.parquet
+
+# Tokenizer and checkpoint files
+*.json
+*.pt
+
+# But keep identity conversations for SFT
+!identity_conversations.jsonl
+
+# HuggingFace datasets cache (can be large!)
+hf_datasets_cache/
+
+# Midtraining dataset metadata
+mid_datasets/
+
+# SFT dataset metadata
+sft_datasets/

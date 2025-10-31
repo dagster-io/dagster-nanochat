@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Data directories (too large for Docker context)
+data/
+*.parquet
+*.pt
+*.tar.gz
+*.json.gz
+
+# Rust build artifacts (will be rebuilt in container)
+rustbpe/target/debug/
+rustbpe/target/release/deps/
+rustbpe/target/release/build/
+rustbpe/target/release/incremental/
+rustbpe/target/.rustc_info.json
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# Tests
+tests/
+
+# CI/CD
+.github/
+

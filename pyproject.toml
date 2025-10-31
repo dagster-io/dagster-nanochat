@@ -4,8 +4,22 @@ requires-python = ">=3.9,<3.14"
 version = "0.1.0"
 dependencies = [
     "dagster==1.12.0",
+    "dagster-aws",
     "requests",
+    "maturin",
+    "tiktoken",
+    "tokenizers",
+    "pyarrow",
+    "torch",
+    "numpy",
+    "datasets",
+    "runpod",
+    "requests",
+    "rustbpe",
 ]
+
+[tool.uv.sources]
+rustbpe = { path = "rustbpe", editable = true }
 
 [dependency-groups]
 dev = [
@@ -31,4 +45,6 @@ registry_modules = [
     "dagster_nanochat.components.*",
 ]
 
-
+[tool.uv]
+# Rebuild rustbpe package when any rust files change
+cache-keys = [{file = "pyproject.toml"}, {file = "rustbpe/Cargo.toml"}, {file = "rustbpe/**/*.rs"}]
