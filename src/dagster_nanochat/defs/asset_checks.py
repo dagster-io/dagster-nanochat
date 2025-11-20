@@ -10,6 +10,7 @@ from dagster_nanochat.defs.assets import (
     SFT_CHECKPOINT_DIRECTORY,
     tokenizer_training,
 )
+from dagster_nanochat.defs.config import TOKENIZER_FILE
 from dagster_nanochat.defs.serverless_resource import ServerlessResource
 from dagster_nanochat.nanochat.chat_eval import run_chat_eval
 from dagster_nanochat.nanochat.engine import Engine
@@ -17,7 +18,6 @@ from dagster_nanochat.nanochat.gpt import GPT, GPTConfig
 from dagster_nanochat.utils.tokenizer_utils import create_tokenizer_with_special_tokens
 
 # Canonical tokenizer file path
-TOKENIZER_FILE = "data/tokenizer/tokenizer.json"
 
 
 # =============================================================================

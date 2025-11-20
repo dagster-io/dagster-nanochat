@@ -42,6 +42,7 @@ from dagster_nanochat.tasks.spellingbee import SimpleSpelling, SpellingBee
 from dagster_nanochat.utils import (
     download_file,
 )
+from dagster_nanochat.utils.checkpoint_utils import wait_and_download_checkpoint
 
 # =============================================================================
 # Tokenizer Training
@@ -205,9 +206,7 @@ def tokenizer_training(
 )
 def nanochat_training_image(context: dg.AssetExecutionContext) -> str:
     """Docker image containing all nanochat training code and dependencies."""
-    image = "dhume/dagster-nanochat:latest"
-    context.log.info(f"Using Docker image: {image}")
-    return image
+    return "dhume/dagster-nanochat:latest"
 
 
 @dg.asset(
@@ -644,9 +643,10 @@ def midtraining_run_config(
         ContentType="application/json",
     )
 
-    context.log.info(f"Config uploaded ({len(config_json)} bytes)")
-    context.log.info(f"   Train datasets: {len(dataset_specs['train'])}")
-    context.log.info(f"   Val datasets: {len(dataset_specs['val'])}")
+    context.log.info(
+        f"Config uploaded: {len(dataset_specs['train'])} train datasets, "
+        f"{len(dataset_specs['val'])} val datasets"
+    )
 
     return config_s3_key
 
@@ -710,76 +710,24 @@ def midtraining_checkpoint(
     pod_id = pod["id"]
 
     try:
-        # Poll S3 for checkpoint completion
+        # Wait for training to complete and download checkpoint
         context.log.info(f"Training in progress on pod: {pod_id}")
         context.log.info("   Check RunPod dashboard for live logs")
 
-        max_wait = 7200  # 2 hours
-        check_interval = 60  # Check every minute
-        start_time = time.time()
-
         s3_checkpoint_key = training_config["s3_output_key"]
-        checkpoint_found = False
-
-        while time.time() - start_time < max_wait:
-            time.sleep(check_interval)
-
-            elapsed = int(time.time() - start_time)
-
-            # Check if checkpoint has been uploaded to S3
-            try:
-                s3.get_client().head_object(
-                    Bucket=S3_BUCKET_NAME, Key=s3_checkpoint_key
-                )
-                context.log.info(f"[{elapsed}s] Checkpoint detected in S3!")
-                checkpoint_found = True
-                break
-            except:
-                # Checkpoint not ready yet, continue waiting
-                context.log.info(f"[{elapsed}s] Waiting for training to complete...")
-
-                # Check pod status for early failure detection
-                pod_status = runpod.get_pod(pod_id)
-                if isinstance(pod_status, list):
-                    pod_status = pod_status[0]
-
-                desired_status = pod_status.get("desiredStatus")
-                if desired_status == "FAILED":
-                    raise RuntimeError("Training pod failed - check RunPod logs")
-
-        if not checkpoint_found:
-            raise TimeoutError(
-                f"Training exceeded {max_wait}s timeout. Checkpoint not found in S3."
-            )
-
-        # Training complete - checkpoint is in S3
-        context.log.info("Downloading checkpoint from S3...")
-        context.log.info(f"   S3 key: {s3_checkpoint_key}")
-
-        # Create local checkpoint directory
         checkpoint_dir = os.path.abspath(
             os.path.join(CHECKPOINT_DIRECTORY, f"{model_tag}-mid")
         )
-        os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Download the tarball from S3
-        local_tarball = f"{checkpoint_dir}/checkpoint.tar.gz"
-        s3.get_client().download_file(S3_BUCKET_NAME, s3_checkpoint_key, local_tarball)
-        context.log.info(f"Downloaded checkpoint: {local_tarball}")
-
-        # Extract tarball
-        context.log.info("Extracting checkpoint...")
-        with tarfile.open(local_tarball, "r:gz") as tar:
-            tar.extractall(checkpoint_dir)
-
-        # Remove tarball after extraction
-        os.remove(local_tarball)
-        context.log.info(f"Checkpoint extracted to: {checkpoint_dir}")
-
-        # Load checkpoint metadata
-        metadata_path = os.path.join(checkpoint_dir, "checkpoint.json")
-        with open(metadata_path, "r") as f:
-            checkpoint_metadata = json.load(f)
+        checkpoint_metadata = wait_and_download_checkpoint(
+            s3_client=s3.get_client(),
+            bucket=S3_BUCKET_NAME,
+            s3_key=s3_checkpoint_key,
+            output_dir=checkpoint_dir,
+            context=context,
+            max_wait_seconds=7200,  # 2 hours
+            check_interval=60,  # Check every minute
+        )
 
         context.log.info("Midtraining complete!")
         context.log.info(
@@ -1142,55 +1090,19 @@ def sft_checkpoint(
     )
 
     try:
-        # Poll S3 for checkpoint to detect completion
+        # Wait for training to complete and download checkpoint
         s3_output_key = training_config["s3_output_key"]
-        context.log.info(f"Waiting for training to complete...")
-        context.log.info(f"Watching for: s3://{S3_BUCKET_NAME}/{s3_output_key}")
-
-        max_wait_seconds = 3600  # 1 hour timeout
-        check_interval = 30
-        elapsed = 0
-
-        while elapsed < max_wait_seconds:
-            try:
-                s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_output_key)
-                context.log.info(f"Training complete! Checkpoint found on S3")
-                break
-            except s3_client.exceptions.ClientError:
-                # Checkpoint not ready yet
-                time.sleep(check_interval)
-                elapsed += check_interval
-                if elapsed % 120 == 0:  # Log every 2 minutes
-                    context.log.info(
-                        f"Still waiting... ({elapsed}s elapsed, checking every {check_interval}s)"
-                    )
-        else:
-            raise TimeoutError(
-                f"Training did not complete within {max_wait_seconds}s. "
-                f"Check RunPod logs for details."
-            )
-
-        # Download checkpoint from S3
         sft_checkpoint_dir = os.path.join(SFT_CHECKPOINT_DIRECTORY, model_tag)
-        os.makedirs(sft_checkpoint_dir, exist_ok=True)
 
-        checkpoint_tarball = os.path.join(sft_checkpoint_dir, "checkpoint.tar.gz")
-        context.log.info(f"Downloading checkpoint from S3...")
-        s3_client.download_file(S3_BUCKET_NAME, s3_output_key, checkpoint_tarball)
-
-        # Extract checkpoint
-        context.log.info(f"Extracting checkpoint...")
-        with tarfile.open(checkpoint_tarball, "r:gz") as tar:
-            tar.extractall(sft_checkpoint_dir)
-
-        # Clean up tarball
-        os.remove(checkpoint_tarball)
-        context.log.info(f"Checkpoint extracted to: {sft_checkpoint_dir}")
-
-        # Load checkpoint metadata for return value
-        checkpoint_metadata_path = os.path.join(sft_checkpoint_dir, "checkpoint.json")
-        with open(checkpoint_metadata_path, "r") as f:
-            checkpoint_metadata = json.load(f)
+        checkpoint_metadata = wait_and_download_checkpoint(
+            s3_client=s3_client,
+            bucket=S3_BUCKET_NAME,
+            s3_key=s3_output_key,
+            output_dir=sft_checkpoint_dir,
+            context=context,
+            max_wait_seconds=3600,  # 1 hour
+            check_interval=30,
+        )
 
         # Prepare checkpoint for serverless Docker build
         # Copy to ./checkpoint/ at repo root for Dockerfile.serverless
@@ -1246,9 +1158,7 @@ def sft_checkpoint(
 )
 def nanochat_serverless_image(context: dg.AssetExecutionContext) -> str:
     """Docker image containing nanochat serverless code and dependencies."""
-    image = "dhume/dagster-nanochat-serverless:latest"
-    context.log.info(f"Using Docker image: {image}")
-    return image
+    return "dhume/dagster-nanochat-serverless:latest"
 
 
 @dg.asset(
@@ -1283,10 +1193,6 @@ def serverless_endpoint(
     template_name = f"nanochat-{model_tag}-template"
     endpoint_name = f"nanochat-{model_tag}"
 
-    context.log.info(f"Docker image: {image_uri}")
-    context.log.info(f"Template name: {template_name}")
-    context.log.info(f"Endpoint name: {endpoint_name}")
-
     # Step 1: Create or update template
     # Search for existing template by name
     existing_template = serverless.find_template_by_name(
@@ -1297,7 +1203,6 @@ def serverless_endpoint(
     if existing_template:
         # Template exists - update with new image
         template_id = existing_template.get("id")
-        context.log.info(f"Updating existing template: {template_id}")
         serverless.update_template(
             template_id=template_id,
             image_name=image_uri,
@@ -1305,7 +1210,6 @@ def serverless_endpoint(
         )
     else:
         # Template doesn't exist - create new one
-        context.log.info(f"Creating new template: {template_name}")
         template_id = serverless.create_template(
             name=template_name,
             image_name=image_uri,
@@ -1313,7 +1217,6 @@ def serverless_endpoint(
             is_serverless=True,
             context=context,
         )
-        context.log.info(f"Template created: {template_id}")
 
     # Step 2: Create or update endpoint
     # Search for existing endpoint by name
@@ -1325,7 +1228,6 @@ def serverless_endpoint(
     if existing_endpoint:
         # Endpoint exists - update with new template
         endpoint_id = existing_endpoint.get("id")
-        context.log.info(f"Updating existing endpoint: {endpoint_id}")
         serverless.update_endpoint(
             endpoint_id=endpoint_id,
             template_id=template_id,
@@ -1333,7 +1235,6 @@ def serverless_endpoint(
         )
     else:
         # Endpoint doesn't exist - create new one
-        context.log.info(f"Creating new endpoint: {endpoint_name}")
         endpoint_id = serverless.create_endpoint(
             name=endpoint_name,
             template_id=template_id,
@@ -1343,9 +1244,7 @@ def serverless_endpoint(
             idle_timeout=30,
             context=context,
         )
-        context.log.info(f"Endpoint created: {endpoint_id}")
 
-    context.log.info(f"Serverless deployment complete!")
     context.log.info(f"View in console: https://www.runpod.io/console/serverless")
 
     # Return with metadata storing both IDs

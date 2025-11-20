@@ -2,37 +2,28 @@
 
 import dagster as dg
 
-from dagster_nanochat.tasks.arc import ARC
-from dagster_nanochat.tasks.gsm8k import GSM8K
-from dagster_nanochat.tasks.mmlu import MMLU
-from dagster_nanochat.tasks.smoltalk import SmolTalk
-from dagster_nanochat.tasks.spellingbee import SimpleSpelling, SpellingBee
-
 # =============================================================================
 # Directory Constants
 # =============================================================================
 
 # Staging directories
 FILE_DIRECTORY = "data/raw"
-VALIDATION_DIRECTORY = "data/validation"
 CHECKPOINT_DIRECTORY = "data/checkpoints"
-MIDTRAIN_CHECKPOINT_DIRECTORY = "data/mid_checkpoints"
 SFT_CHECKPOINT_DIRECTORY = "data/sft_checkpoints"
-MIDTRAIN_DATASETS_CACHE = "data/mid_datasets"
 SFT_DATASETS_CACHE = "data/sft_datasets"
 HF_DATASETS_CACHE = "data/hf_datasets_cache"
 S3_BUCKET_NAME = "dagster-nanochat"
+TOKENIZER_FILE = "data/tokenizer/tokenizer.json"
+
 
 # =============================================================================
 # Dataset Constants
 # =============================================================================
 
 # Hugging Face Karpathy datasets
-MAX_SHARDS = 1823
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle"
-SHARDS = [f"{BASE_URL}/resolve/main/shard_{i:05d}.parquet" for i in range(MAX_SHARDS)]
+SHARDS = [f"{BASE_URL}/resolve/main/shard_{i:05d}.parquet" for i in range(1823)]
 TRAINING_SET = SHARDS[:-1]
-VALIDATION_SET = SHARDS[-1:]
 
 # Special tokens for conversation rendering
 CONVERSATION_SPECIAL_TOKENS = [
@@ -46,62 +37,6 @@ CONVERSATION_SPECIAL_TOKENS = [
     "<|output_start|>",
     "<|output_end|>",
 ]
-
-# =============================================================================
-# Midtraining Dataset Configurations
-# =============================================================================
-
-# Define midtraining dataset partitions with configurations
-MIDTRAINING_DATASET_CONFIGS = {
-    "smoltalk_train": {
-        "class": SmolTalk,
-        "quick_mode_kwargs": {"split": "train", "stop": 1000},
-        "full_mode_kwargs": {"split": "train"},
-    },
-    "smoltalk_val": {
-        "class": SmolTalk,
-        "quick_mode_kwargs": {"split": "test", "stop": 100},
-        "full_mode_kwargs": {"split": "test"},
-    },
-    "mmlu_train": {
-        "class": MMLU,
-        "quick_mode_kwargs": {
-            "subset": "auxiliary_train",
-            "split": "train",
-            "stop": 500,
-        },
-        "full_mode_kwargs": {"subset": "auxiliary_train", "split": "train"},
-    },
-    "mmlu_val": {
-        "class": MMLU,
-        "quick_mode_kwargs": {"subset": "all", "split": "test", "stop": 100},
-        "full_mode_kwargs": {"subset": "all", "split": "test", "stop": 5200},
-    },
-    "gsm8k_train": {
-        "class": GSM8K,
-        "quick_mode_kwargs": None,  # Skip in quick mode
-        "full_mode_kwargs": {"subset": "main", "split": "train"},
-    },
-    "gsm8k_val": {
-        "class": GSM8K,
-        "quick_mode_kwargs": None,  # Skip in quick mode
-        "full_mode_kwargs": {"subset": "main", "split": "test", "stop": 420},
-    },
-    "simple_spelling_train": {
-        "class": SimpleSpelling,
-        "quick_mode_kwargs": None,  # Skip in quick mode
-        "full_mode_kwargs": {"size": 200000, "split": "train"},
-    },
-    "spelling_bee_train": {
-        "class": SpellingBee,
-        "quick_mode_kwargs": None,  # Skip in quick mode
-        "full_mode_kwargs": {"size": 80000, "split": "train"},
-    },
-}
-
-# Partition keys for Dagster
-MIDTRAINING_DATASETS = list(MIDTRAINING_DATASET_CONFIGS.keys())
-
 
 # =============================================================================
 # Unified Configuration

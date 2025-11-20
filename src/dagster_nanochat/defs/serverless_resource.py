@@ -1,10 +1,3 @@
-"""
-Dagster resource for RunPod Serverless inference.
-
-This resource provides a simple interface for calling RunPod Serverless
-endpoints for inference.
-"""
-
 import os
 import time
 from typing import Any
@@ -432,15 +425,7 @@ class ServerlessResource(dg.ConfigurableResource):
             timeout=10,
         )
         response.raise_for_status()
-        data = response.json()
-
-        # Debug: Log response structure
-        if context:
-            context.log.debug(f"API response type: {type(data)}")
-            if isinstance(data, dict):
-                context.log.debug(f"Response keys: {data.keys()}")
-
-        return data
+        return response.json()
 
     def find_endpoint_by_name(
         self,
@@ -459,11 +444,6 @@ class ServerlessResource(dg.ConfigurableResource):
             context.log.info(f"Searching for endpoint: {name}")
 
         endpoints = self.list_endpoints(context=context)
-
-        # Debug: Log all endpoint names
-        if context:
-            endpoint_names = [ep.get("name") for ep in endpoints]
-            context.log.info(f"Found {len(endpoints)} endpoints: {endpoint_names}")
 
         for endpoint in endpoints:
             endpoint_name = endpoint.get("name", "")
