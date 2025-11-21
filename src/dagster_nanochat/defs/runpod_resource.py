@@ -6,20 +6,6 @@ import runpod
 
 
 class RunPodResource(dg.ConfigurableResource):
-    """
-    Dagster resource for managing RunPod GPU instances.
-
-    Provides methods to create and terminate pods using a Docker image
-    that contains all code, dependencies, and the rustbpe tokenizer.
-
-    Configuration:
-    - api_key: RunPod API key
-    - gpu_type_id: GPU type (e.g., 'NVIDIA A40', 'RTX A4000')
-    - gpu_count: Number of GPUs (1-8, default 2 for DDP training)
-    - cloud_type: SECURE, COMMUNITY, or ALL
-    - env_variables: Optional dict of environment variables to pass to container
-    """
-
     api_key: str
     gpu_type_id: str = "NVIDIA A40"
     gpu_count: int = 2

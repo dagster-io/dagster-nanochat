@@ -21,10 +21,8 @@ runpod_training_resource = RunPodResource(
     gpu_count=2,
     gpu_type_id="NVIDIA A40",
     env_variables={
-        # Pass AWS credentials to RunPod container as environment variables
         "RUNPOD_SECRET_AWS_ACCESS_KEY_ID": dg.EnvVar("AWS_ACCESS_KEY_ID"),
         "RUNPOD_SECRET_AWS_SECRET_ACCESS_KEY": dg.EnvVar("AWS_SECRET_ACCESS_KEY"),
-        # Enable detailed error tracebacks for distributed tAaining
         "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
         "TORCHELASTIC_ERROR_FILE": "/workspace/error.json",
     },

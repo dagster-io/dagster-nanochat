@@ -6,16 +6,11 @@ import dagster as dg
 import requests
 from pydantic import Field
 
+REST_API_BASE = "https://rest.runpod.io/v1"
+INFERENCE_API_BASE = "https://api.runpod.ai/v2"
+
 
 class ServerlessResource(dg.ConfigurableResource):
-    """
-    Resource for running inference on RunPod Serverless endpoints.
-
-    Attributes:
-        api_key: RunPod API key (from environment variable RUNPOD_API_KEY)
-        timeout: Maximum time to wait for a response (seconds)
-    """
-
     api_key: str = Field(
         default_factory=lambda: os.getenv("RUNPOD_API_KEY", ""),
         description="RunPod API key",
@@ -31,6 +26,70 @@ class ServerlessResource(dg.ConfigurableResource):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        api_base: str = None,
+        json_data: dict | None = None,
+        timeout: int = 30,
+        handle_404: bool = False,
+        accept_status_codes: tuple[int, ...] = (200,),
+    ) -> dict | None:
+        """
+        Helper method to make API requests with consistent error handling.
+
+        Args:
+            method: HTTP method (GET, POST, PATCH, etc.)
+            endpoint: API endpoint path (e.g., "/templates" or "/templates/{id}")
+            api_base: Base URL to use (defaults to REST_API_BASE)
+            json_data: JSON payload for POST/PATCH requests
+            timeout: Request timeout in seconds
+            context: Optional Dagster context for logging
+            handle_404: If True, return None for 404 responses instead of raising
+            accept_status_codes: Tuple of acceptable status codes (default: (200,))
+
+        Returns:
+            Response JSON dict, or None if 404 and handle_404=True
+
+        Raises:
+            RuntimeError: If request fails or returns unexpected status code
+        """
+        if api_base is None:
+            api_base = REST_API_BASE
+
+        url = f"{api_base}{endpoint}"
+
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                json=json_data,
+                headers=self._get_headers(),
+                timeout=timeout,
+            )
+
+            # Handle 404 if requested
+            if response.status_code == 404 and handle_404:
+                return None
+
+            # Check if status code is acceptable
+            if response.status_code not in accept_status_codes:
+                error_detail = response.text
+                raise RuntimeError(
+                    f"Request failed (status {response.status_code}): {error_detail}"
+                )
+
+            response.raise_for_status()
+
+            # Return JSON if available, otherwise return empty dict
+            if response.content:
+                return response.json()
+            return {}
+
+        except requests.exceptions.RequestException as e:
+            raise
 
     def create_template(
         self,
@@ -58,11 +117,6 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/templates/POST/templates
         """
-        if context:
-            context.log.info(f"Creating RunPod template: {name}")
-
-        url = "https://rest.runpod.io/v1/templates"
-
         payload = {
             "name": name,
             "imageName": image_name,
@@ -71,34 +125,24 @@ class ServerlessResource(dg.ConfigurableResource):
             "isPublic": False,
         }
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=self._get_headers(),
-            timeout=30,
-        )
-
-        # Accept both 200 (OK) and 201 (Created) as success
-        if response.status_code not in (200, 201):
-            error_detail = response.text
-
+        try:
+            data = self._make_request(
+                method="POST",
+                endpoint="/templates",
+                json_data=payload,
+                timeout=30,
+                context=context,
+                accept_status_codes=(200, 201),
+            )
+        except RuntimeError as e:
             # Check if error is "Template name must be unique"
-            if (
-                response.status_code == 500
-                and "Template name must be unique" in error_detail
-            ):
-                if context:
-                    context.log.warning(
-                        f"Template '{name}' already exists, searching for existing template..."
-                    )
-
+            error_message = str(e)
+            if "Template name must be unique" in error_message:
                 # Try to find the existing template by name
                 existing_template = self.find_template_by_name(name, context=context)
 
                 if existing_template:
                     template_id = existing_template.get("id")
-                    if context:
-                        context.log.info(f"Found existing template: {template_id}")
                     return template_id
                 else:
                     # Template exists but we can't find it - this shouldn't happen
@@ -107,28 +151,13 @@ class ServerlessResource(dg.ConfigurableResource):
                         f"Please delete it manually at https://www.runpod.io/console/serverless "
                         f"and re-run this asset."
                     )
+            # Re-raise other errors
+            raise
 
-            # Other errors
-            if context:
-                context.log.error(
-                    f"Failed to create template. Status: {response.status_code}"
-                )
-                context.log.error(f"Response: {error_detail}")
-                context.log.error(f"Payload sent: {payload}")
-            raise RuntimeError(
-                f"Failed to create template (status {response.status_code}): {error_detail}"
-            )
-
-        response.raise_for_status()
-
-        data = response.json()
         template_id = data.get("id")
 
         if not template_id:
             raise RuntimeError(f"No template ID returned: {data}")
-
-        if context:
-            context.log.info(f"Template created: {template_id}")
 
         return template_id
 
@@ -151,11 +180,6 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/templates/PATCH/templates/templateId
         """
-        if context:
-            context.log.info(f"Updating RunPod template: {template_id}")
-
-        url = f"https://rest.runpod.io/v1/templates/{template_id}"
-
         # Build update payload with only provided fields
         payload = {}
         if image_name is not None:
@@ -164,20 +188,15 @@ class ServerlessResource(dg.ConfigurableResource):
             payload["containerDiskInGb"] = container_disk_gb
 
         if not payload:
-            if context:
-                context.log.info("No update parameters provided")
             return
 
-        response = requests.patch(
-            url,
-            json=payload,
-            headers=self._get_headers(),
+        self._make_request(
+            method="PATCH",
+            endpoint=f"/templates/{template_id}",
+            json_data=payload,
             timeout=30,
+            context=context,
         )
-        response.raise_for_status()
-
-        if context:
-            context.log.info(f"Template updated successfully")
 
     def get_template(
         self,
@@ -191,27 +210,13 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/templates/GET/templates/templateId
         """
-        if context:
-            context.log.info(f"Checking for template: {template_id}")
-        url = f"https://rest.runpod.io/v1/templates/{template_id}"
-        try:
-            response = requests.get(
-                url,
-                headers=self._get_headers(),
-                timeout=10,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                if context:
-                    context.log.info(f"Template {template_id} not found (404).")
-                return None
-            raise
-        except Exception as e:
-            if context:
-                context.log.error(f"Error getting template {template_id}: {e}")
-            raise
+        return self._make_request(
+            method="GET",
+            endpoint=f"/templates/{template_id}",
+            timeout=10,
+            context=context,
+            handle_404=True,
+        )
 
     def list_templates(
         self,
@@ -226,21 +231,12 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/templates/GET/templates
         """
-        if context:
-            context.log.info("Listing all templates")
-        url = "https://rest.runpod.io/v1/templates"
-        try:
-            response = requests.get(
-                url,
-                headers=self._get_headers(),
-                timeout=10,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            if context:
-                context.log.error(f"Error listing templates: {e}")
-            raise
+        return self._make_request(
+            method="GET",
+            endpoint="/templates",
+            timeout=10,
+            context=context,
+        )
 
     def find_template_by_name(
         self,
@@ -251,19 +247,12 @@ class ServerlessResource(dg.ConfigurableResource):
         Find a template by name.
         Returns the template dict if found, None otherwise.
         """
-        if context:
-            context.log.info(f"Searching for template: {name}")
-
         templates = self.list_templates(context=context)
 
         for template in templates:
             if template.get("name") == name:
-                if context:
-                    context.log.info(f"Found template: {template.get('id')}")
                 return template
 
-        if context:
-            context.log.info(f"Template '{name}' not found")
         return None
 
     def run_inference(
@@ -279,7 +268,7 @@ class ServerlessResource(dg.ConfigurableResource):
         Run inference on the serverless endpoint (async with polling).
 
         Args:
-            endpoint_id: RunPod Serverless endpoint ID (e.g., "9xfrqwkqdnm449")
+            endpoint_id: RunPod Serverless endpoint ID
             messages: List of conversation messages with 'role' and 'content'
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -287,23 +276,9 @@ class ServerlessResource(dg.ConfigurableResource):
             context: Optional Dagster context for logging
 
         Returns:
-            Response dictionary from your custom handler
-
-        Example:
-            ```python
-            response = serverless.run_inference(
-                endpoint_id="9xfrqwkqdnm449",
-                messages=[{"role": "user", "content": "Hello!"}],
-                max_tokens=100,
-            )
-            print(response["response"])
-            ```
+            Response dictionary from custom handler
         """
-        if context:
-            context.log.info(f"Calling serverless endpoint: {endpoint_id}")
-
         # Submit job
-        url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
         payload = {
             "input": {
                 "messages": messages,
@@ -313,47 +288,39 @@ class ServerlessResource(dg.ConfigurableResource):
             }
         }
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=self._get_headers(),
+        job_data = self._make_request(
+            method="POST",
+            endpoint=f"/{endpoint_id}/run",
+            api_base=INFERENCE_API_BASE,
+            json_data=payload,
             timeout=30,
+            context=context,
         )
-        response.raise_for_status()
 
-        job_data = response.json()
         job_id = job_data.get("id")
 
         if not job_id:
             raise ValueError(f"No job ID returned: {job_data}")
 
-        if context:
-            context.log.info(f"Job submitted: {job_id}")
-
         # Poll for results
-        status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
         start_time = time.time()
 
         while True:
             if time.time() - start_time > self.timeout:
                 raise TimeoutError(f"Inference timed out after {self.timeout}s")
 
-            status_response = requests.get(
-                status_url,
-                headers=self._get_headers(),
+            status_data = self._make_request(
+                method="GET",
+                endpoint=f"/{endpoint_id}/status/{job_id}",
+                api_base=INFERENCE_API_BASE,
                 timeout=10,
+                context=context,
             )
-            status_response.raise_for_status()
 
-            status_data = status_response.json()
             status = status_data.get("status")
 
             if status == "COMPLETED":
                 output = status_data.get("output", {})
-                if context:
-                    context.log.info(
-                        f"Inference complete. Tokens: {output.get('tokens_generated', 'N/A')}"
-                    )
                 return output
 
             elif status == "FAILED":
@@ -385,21 +352,13 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/endpoints/GET/endpoints/endpointId
         """
-        url = f"https://rest.runpod.io/v1/endpoints/{endpoint_id}"
-
-        response = requests.get(
-            url,
-            headers=self._get_headers(),
+        return self._make_request(
+            method="GET",
+            endpoint=f"/endpoints/{endpoint_id}",
             timeout=30,
+            context=context,
+            handle_404=True,
         )
-
-        if response.status_code == 404:
-            if context:
-                context.log.info(f"Endpoint {endpoint_id} not found")
-            return None
-
-        response.raise_for_status()
-        return response.json()
 
     def list_endpoints(
         self,
@@ -414,18 +373,12 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/endpoints/GET/endpoints
         """
-        if context:
-            context.log.info("Listing all endpoints")
-
-        url = "https://rest.runpod.io/v1/endpoints"
-
-        response = requests.get(
-            url,
-            headers=self._get_headers(),
+        return self._make_request(
+            method="GET",
+            endpoint="/endpoints",
             timeout=10,
+            context=context,
         )
-        response.raise_for_status()
-        return response.json()
 
     def find_endpoint_by_name(
         self,
@@ -440,24 +393,14 @@ class ServerlessResource(dg.ConfigurableResource):
 
         Returns the endpoint dict if found, None otherwise.
         """
-        if context:
-            context.log.info(f"Searching for endpoint: {name}")
-
         endpoints = self.list_endpoints(context=context)
 
         for endpoint in endpoints:
             endpoint_name = endpoint.get("name", "")
             # Match exact name or name with RunPod suffix (starts with name followed by space)
             if endpoint_name == name or endpoint_name.startswith(f"{name} "):
-                endpoint_id = endpoint.get("id")
-                if context:
-                    context.log.info(
-                        f"Found endpoint '{endpoint_name}' (ID: {endpoint_id})"
-                    )
                 return endpoint
 
-        if context:
-            context.log.info(f"Endpoint '{name}' not found")
         return None
 
     def create_endpoint(
@@ -491,12 +434,6 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/endpoints/POST/endpoints
         """
-        if context:
-            context.log.info(f"Creating serverless endpoint: {name}")
-            context.log.info(f"Using template: {template_id}")
-
-        url = "https://rest.runpod.io/v1/endpoints"
-
         payload = {
             "name": name,
             "templateId": template_id,
@@ -506,36 +443,19 @@ class ServerlessResource(dg.ConfigurableResource):
             "idleTimeout": idle_timeout,
         }
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=self._get_headers(),
+        data = self._make_request(
+            method="POST",
+            endpoint="/endpoints",
+            json_data=payload,
             timeout=30,
+            context=context,
+            accept_status_codes=(200, 201),
         )
 
-        # Accept both 200 (OK) and 201 (Created) as success
-        if response.status_code not in (200, 201):
-            error_detail = response.text
-            if context:
-                context.log.error(
-                    f"Failed to create endpoint. Status: {response.status_code}"
-                )
-                context.log.error(f"Response: {error_detail}")
-                context.log.error(f"Payload sent: {payload}")
-            raise RuntimeError(
-                f"Failed to create endpoint (status {response.status_code}): {error_detail}"
-            )
-
-        response.raise_for_status()
-
-        data = response.json()
         endpoint_id = data.get("id")
 
         if not endpoint_id:
             raise RuntimeError(f"No endpoint ID returned: {data}")
-
-        if context:
-            context.log.info(f"Created endpoint: {endpoint_id}")
 
         return endpoint_id
 
@@ -560,11 +480,6 @@ class ServerlessResource(dg.ConfigurableResource):
         Reference:
             https://docs.runpod.io/api-reference/endpoints/POST/endpoints/endpointId/update
         """
-        if context:
-            context.log.info(f"Updating serverless endpoint: {endpoint_id}")
-
-        url = f"https://rest.runpod.io/v1/endpoints/{endpoint_id}/update"
-
         # Build update payload with only provided fields
         payload = {}
         if template_id is not None:
@@ -574,13 +489,10 @@ class ServerlessResource(dg.ConfigurableResource):
         if workers_max is not None:
             payload["workersMax"] = workers_max
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=self._get_headers(),
+        self._make_request(
+            method="POST",
+            endpoint=f"/endpoints/{endpoint_id}/update",
+            json_data=payload,
             timeout=30,
+            context=context,
         )
-        response.raise_for_status()
-
-        if context:
-            context.log.info(f"Endpoint updated successfully")
