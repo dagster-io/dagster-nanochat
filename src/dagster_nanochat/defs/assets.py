@@ -24,8 +24,10 @@ from dagster_nanochat.defs.config import (
     SFT_CHECKPOINT_DIRECTORY,
     SFT_DATASETS_CACHE,
     TRAINING_SET,
+    BaseTrainingConfig,
     ChatInferenceConfig,
-    NanochatConfig,
+    MidtrainingConfig,
+    SFTConfig,
 )
 from dagster_nanochat.defs.runpod_resource import RunPodResource
 from dagster_nanochat.defs.serverless_resource import ServerlessResource
@@ -35,6 +37,7 @@ from dagster_nanochat.tasks.arc import ARC
 from dagster_nanochat.tasks.common import TaskMixture
 from dagster_nanochat.tasks.customjson import CustomJSON
 from dagster_nanochat.tasks.gsm8k import GSM8K
+from dagster_nanochat.tasks.mmlu import MMLU
 from dagster_nanochat.tasks.smoltalk import SmolTalk
 from dagster_nanochat.tasks.spellingbee import SimpleSpelling, SpellingBee
 
@@ -100,7 +103,7 @@ def tokenizer_training(
     s3: S3Resource,
 ) -> dg.MaterializeResult:
     """
-    Train a single BPE tokenizer on ALL training data using Rust.
+    Train a single BPE tokenizer on training data using Rust.
 
     This implements tokenizer training of the nanochat pipeline:
     - Uses high-performance Rust BPE implementation
@@ -108,9 +111,6 @@ def tokenizer_training(
     - Creates ONE canonical tokenizer file: data/tokenizer/tokenizer.json
     - Learns merge rules optimized for the full dataset distribution
     - Uses GPT-4 regex pattern for tokenization
-
-    Matches the original nanochat approach of training a single tokenizer
-    on representative data from across all shards.
 
     Note: Always trains on all available data for best tokenizer quality.
     Tokenizer training is fast enough that there's no need for a "quick mode".
@@ -215,24 +215,15 @@ def nanochat_training_image(context: dg.AssetExecutionContext) -> str:
     group_name="base_model_training",
 )
 def model_run_config(
-    context: dg.AssetExecutionContext, config: NanochatConfig, s3: S3Resource
+    context: dg.AssetExecutionContext, config: BaseTrainingConfig, s3: S3Resource
 ) -> str:
     """Upload training configuration to S3 for RunPod to download."""
-    # Configure training parameters based on mode
-    if config.quick_mode:
-        depth = 4
-        max_seq_len = 512
-        device_batch_size = 32
-        total_batch_size = 524288
-        num_iterations = 100
-        eval_every = 25
-    else:
-        depth = config.depth
-        max_seq_len = config.max_seq_len
-        device_batch_size = config.device_batch_size
-        total_batch_size = config.total_batch_size
-        num_iterations = config.num_iterations
-        eval_every = config.eval_every
+    depth = config.depth
+    max_seq_len = config.max_seq_len
+    device_batch_size = config.device_batch_size
+    total_batch_size = config.total_batch_size
+    num_iterations = config.num_iterations
+    eval_every = config.eval_every
 
     # Load tokenizer info to get vocab size
     tokenizer_path = os.path.abspath("data/tokenizer/tokenizer.json")
@@ -279,9 +270,8 @@ def model_run_config(
         "warmdown_ratio": config.warmdown_ratio,
         "final_lr_frac": config.final_lr_frac,
         "eval_tokens": config.eval_tokens,
-        "eval_steps": config.eval_steps,
+        "sample_every": config.sample_every,
         "special_tokens": CONVERSATION_SPECIAL_TOKENS,
-        "quick_mode": config.quick_mode,
         "s3_bucket": S3_BUCKET_NAME,
         "s3_tokenizer_key": "tokenizer.json",
         "s3_checkpoint_key": f"checkpoints/{config.model_tag}/checkpoint.tar.gz",
@@ -305,7 +295,6 @@ def model_run_config(
 @dg.asset(
     deps=[
         tokenizer_training,
-        training_files,
         raw_data,
         nanochat_training_image,
         model_run_config,
@@ -316,7 +305,7 @@ def model_run_config(
 )
 def base_model_checkpoint(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: BaseTrainingConfig,
     runpod: RunPodResource,
     s3: S3Resource,
     nanochat_training_image: str,
@@ -473,7 +462,6 @@ def base_model_checkpoint(
                 "final_loss": checkpoint_metadata["final_loss"],
                 "best_val_bpb": checkpoint_metadata["best_val_bpb"],
                 "device": checkpoint_metadata["device"],
-                "quick_mode": training_config["quick_mode"],
                 "pod_id": pod_id,
                 "execution_mode": "runpod",
                 "gpu_count": runpod.gpu_count,
@@ -493,21 +481,179 @@ def base_model_checkpoint(
 
 
 @dg.asset(
-    deps=[base_model_checkpoint],
+    deps=[raw_data],
+    kinds={"huggingface", "s3"},
+    group_name="midtraining",
+)
+def midtraining_datasets(
+    context: dg.AssetExecutionContext,
+    config: MidtrainingConfig,
+    s3: S3Resource,
+) -> dg.MaterializeResult:
+    """
+    Download midtraining datasets from HuggingFace, serialize, and upload to S3.
+
+    This asset:
+    - Downloads conversational and reasoning datasets from HuggingFace
+    - Serializes train/val datasets as JSONL files
+    - Uploads to S3 for use in RunPod training
+
+    Datasets:
+    - SmolTalk: conversational data
+    - MMLU: multiple choice reasoning
+    - GSM8K: math word problems
+    - Spelling tasks: SimpleSpelling + SpellingBee
+
+    Returns:
+        MaterializeResult with S3 paths and dataset metadata
+    """
+    context.log.info("Preparing midtraining datasets...")
+
+    # Set HuggingFace cache to local directory within the repo
+    hf_cache_dir = os.path.abspath(HF_DATASETS_CACHE)
+    os.makedirs(hf_cache_dir, exist_ok=True)
+    os.environ["HF_DATASETS_CACHE"] = hf_cache_dir
+    os.environ["HF_HOME"] = hf_cache_dir
+    context.log.info(f"HuggingFace cache directory: {hf_cache_dir}")
+
+    # Create cache directory for metadata
+    midtraining_cache = "data/midtraining_datasets"
+    os.makedirs(midtraining_cache, exist_ok=True)
+
+    # Initialize datasets (triggers download if needed)
+    # Use smaller datasets for $1 tier (max_seq_len == 512)
+    if config.max_seq_len == 512:
+        context.log.info("$1 tier: Loading small dataset subsets...")
+        train_datasets = [
+            SmolTalk(split="train", stop=1000),  # 1K rows
+            MMLU(subset="auxiliary_train", split="train", stop=500),  # 500 rows
+        ]  # Total: ~1.5K rows
+        val_datasets = [
+            SmolTalk(split="test", stop=100),  # 100 rows
+            MMLU(subset="all", split="test", stop=100),  # 100 rows
+        ]
+    else:
+        context.log.info("$10/$100 tier: Loading complete datasets...")
+        train_datasets = [
+            SmolTalk(split="train"),  # Full training set
+            MMLU(subset="auxiliary_train", split="train"),  # Full auxiliary train
+            GSM8K(subset="main", split="train"),  # ~8K rows
+            SimpleSpelling(size=200000, split="train"),  # 200K rows
+            SpellingBee(size=80000, split="train"),  # 80K rows
+        ]
+        val_datasets = [
+            SmolTalk(split="test"),  # Full test set
+            MMLU(subset="all", split="test", stop=5200),  # 5.2K rows
+            GSM8K(subset="main", split="test", stop=420),  # 420 rows
+        ]
+
+    # Create task mixtures
+    from dagster_nanochat.tasks.common import TaskMixture
+
+    train_dataset = TaskMixture(train_datasets)
+    val_dataset = TaskMixture(val_datasets)
+
+    train_size = len(train_dataset)
+    val_size = len(val_dataset)
+
+    context.log.info(f"Training dataset: {train_size:,} examples")
+    context.log.info(f"Validation dataset: {val_size:,} examples")
+
+    # Serialize and upload to S3
+    context.log.info("Serializing datasets to JSONL...")
+    model_tag = config.model_tag if config.model_tag else "d4"
+
+    # Create temporary directory for serialization
+    temp_dir = os.path.join("data", "temp_midtraining_datasets")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        # Serialize train dataset
+        train_path = os.path.join(temp_dir, "train.jsonl")
+        context.log.info(f"Serializing {len(train_dataset)} training examples...")
+        with open(train_path, "w") as f:
+            for i in range(len(train_dataset)):
+                conversation = train_dataset[i]
+                f.write(json.dumps(conversation) + "\n")
+        context.log.info(f"Saved training data to: {train_path}")
+
+        # Serialize val dataset
+        val_path = os.path.join(temp_dir, "val.jsonl")
+        context.log.info(f"Serializing {len(val_dataset)} validation examples...")
+        with open(val_path, "w") as f:
+            for i in range(len(val_dataset)):
+                conversation = val_dataset[i]
+                f.write(json.dumps(conversation) + "\n")
+        context.log.info(f"Saved validation data to: {val_path}")
+
+        # Upload to S3
+        s3_client = s3.get_client()
+        train_s3_key = f"datasets/midtraining/{model_tag}/train.jsonl"
+        val_s3_key = f"datasets/midtraining/{model_tag}/val.jsonl"
+
+        context.log.info(f"Uploading train dataset to S3: {train_s3_key}")
+        s3_client.upload_file(train_path, S3_BUCKET_NAME, train_s3_key)
+
+        context.log.info(f"Uploading val dataset to S3: {val_s3_key}")
+        s3_client.upload_file(val_path, S3_BUCKET_NAME, val_s3_key)
+
+        context.log.info("All datasets uploaded to S3")
+
+    finally:
+        # Cleanup temporary files
+        import shutil
+
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            context.log.info(f"Cleaned up temporary directory: {temp_dir}")
+
+    # Store metadata for reference
+    dataset_info = {
+        "model_tag": config.model_tag,
+        "train_size": train_size,
+        "val_size": val_size,
+        "num_train_datasets": len(train_datasets),
+        "num_val_datasets": len(val_datasets),
+        "train_datasets": [type(ds).__name__ for ds in train_datasets],
+        "val_datasets": [type(ds).__name__ for ds in val_datasets],
+    }
+
+    metadata_path = os.path.join(midtraining_cache, "dataset_info.json")
+    with open(metadata_path, "w") as f:
+        json.dump(dataset_info, f, indent=2)
+
+    context.log.info(f"Dataset info saved to: {metadata_path}")
+
+    return dg.MaterializeResult(
+        metadata={
+            "train_s3_key": train_s3_key,
+            "val_s3_key": val_s3_key,
+            "train_size": train_size,
+            "val_size": val_size,
+            "model_tag": config.model_tag,
+            "num_train_datasets": len(train_datasets),
+            "num_val_datasets": len(val_datasets),
+        }
+    )
+
+
+@dg.asset(
+    deps=[midtraining_datasets],
     kinds={"s3"},
     group_name="midtraining",
 )
 def midtraining_run_config(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: MidtrainingConfig,
     s3: S3Resource,
+    midtraining_datasets: dg.MaterializeResult,
 ) -> str:
     """
     Create and upload midtraining configuration to S3.
 
-    This asset prepares the training configuration including dataset specifications,
-    hyperparameters, and S3 paths. It also uploads the locally cached base checkpoint
-    to S3 for the RunPod instance to download.
+    This asset prepares the training configuration including S3 paths to pre-serialized
+    JSONL datasets, hyperparameters, and checkpoint paths. It also uploads the locally
+    cached base checkpoint to S3 for the RunPod instance to download.
     """
     context.log.info("📝 Preparing midtraining configuration...")
 
@@ -545,73 +691,33 @@ def midtraining_run_config(
         if os.path.exists(tmp_tarball):
             os.remove(tmp_tarball)
 
-    # Define dataset specifications (will be downloaded on RunPod)
-    if config.quick_mode:
-        context.log.info("Quick mode: Using small dataset subsets")
-        dataset_specs = {
-            "train": [
-                {"class": "SmolTalk", "kwargs": {"split": "train", "stop": 1000}},
-                {
-                    "class": "MMLU",
-                    "kwargs": {
-                        "subset": "auxiliary_train",
-                        "split": "train",
-                        "stop": 500,
-                    },
-                },
-            ],
-            "val": [
-                {"class": "SmolTalk", "kwargs": {"split": "test", "stop": 100}},
-                {
-                    "class": "MMLU",
-                    "kwargs": {"subset": "all", "split": "test", "stop": 100},
-                },
-            ],
-        }
-        max_seq_len = 512
-        device_batch_size = 1
-        total_batch_size = 512
-        num_iterations = 50
-        eval_every = 25
-        eval_tokens = 512
-    else:
-        context.log.info("Full mode: Using complete datasets")
-        dataset_specs = {
-            "train": [
-                {"class": "SmolTalk", "kwargs": {"split": "train"}},
-                {
-                    "class": "MMLU",
-                    "kwargs": {"subset": "auxiliary_train", "split": "train"},
-                },
-                {"class": "GSM8K", "kwargs": {"subset": "main", "split": "train"}},
-                {
-                    "class": "SimpleSpelling",
-                    "kwargs": {"size": 200000, "split": "train"},
-                },
-                {"class": "SpellingBee", "kwargs": {"size": 80000, "split": "train"}},
-            ],
-            "val": [
-                {"class": "SmolTalk", "kwargs": {"split": "test"}},
-                {
-                    "class": "MMLU",
-                    "kwargs": {"subset": "all", "split": "test", "stop": 5200},
-                },
-                {
-                    "class": "GSM8K",
-                    "kwargs": {"subset": "main", "split": "test", "stop": 420},
-                },
-            ],
-        }
-        max_seq_len = config.max_seq_len
-        device_batch_size = config.device_batch_size
-        total_batch_size = config.total_batch_size
-        num_iterations = config.num_iterations
-        eval_every = config.eval_every
-        eval_tokens = config.eval_tokens
+    # Get dataset S3 keys from upstream asset
+    train_s3_key = midtraining_datasets.metadata["train_s3_key"].value
+    val_s3_key = midtraining_datasets.metadata["val_s3_key"].value
+    train_size = midtraining_datasets.metadata["train_size"].value
+    val_size = midtraining_datasets.metadata["val_size"].value
+
+    context.log.info(
+        f"Using pre-serialized datasets: {train_size} train, {val_size} val examples"
+    )
+    context.log.info(f"Train dataset S3: s3://{S3_BUCKET_NAME}/{train_s3_key}")
+    context.log.info(f"Val dataset S3: s3://{S3_BUCKET_NAME}/{val_s3_key}")
+
+    # Always use config values for training params
+    max_seq_len = config.max_seq_len
+    device_batch_size = config.device_batch_size
+    total_batch_size = config.total_batch_size
+    num_iterations = config.num_iterations
+    eval_every = config.eval_every
+    eval_tokens = config.eval_tokens
 
     # Prepare training configuration
     training_config = {
-        "dataset_specs": dataset_specs,
+        # Dataset paths (pre-processed JSONL on S3)
+        "s3_bucket": S3_BUCKET_NAME,
+        "s3_train_dataset_key": train_s3_key,
+        "s3_val_dataset_key": val_s3_key,
+        # Training hyperparameters
         "max_seq_len": max_seq_len,
         "device_batch_size": device_batch_size,
         "total_batch_size": total_batch_size,
@@ -623,9 +729,8 @@ def midtraining_run_config(
         "matrix_lr": config.matrix_lr,
         "init_lr_frac": config.init_lr_frac,
         "weight_decay": config.weight_decay,
-        "quick_mode": config.quick_mode,
+        # Model and checkpoint paths
         "model_tag": model_tag,
-        "s3_bucket": S3_BUCKET_NAME,
         "s3_base_checkpoint_key": f"checkpoints/{model_tag}/checkpoint.tar.gz",
         "s3_tokenizer_key": "tokenizer.json",
         "s3_output_key": f"checkpoints/{model_tag}-mid/checkpoint.tar.gz",
@@ -644,22 +749,26 @@ def midtraining_run_config(
     )
 
     context.log.info(
-        f"Config uploaded: {len(dataset_specs['train'])} train datasets, "
-        f"{len(dataset_specs['val'])} val datasets"
+        f"Config uploaded with datasets: {train_size} train examples, {val_size} val examples"
     )
 
     return config_s3_key
 
 
 @dg.asset(
-    deps=[base_model_checkpoint, midtraining_run_config, nanochat_training_image],
+    deps=[
+        base_model_checkpoint,
+        midtraining_run_config,
+        nanochat_training_image,
+        midtraining_datasets,
+    ],
     kinds={"pytorch", "runpod"},
     group_name="midtraining",
     backfill_policy=dg.BackfillPolicy.single_run(),
 )
 def midtraining_checkpoint(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: MidtrainingConfig,
     runpod: RunPodResource,
     s3: S3Resource,
     midtraining_run_config: str,
@@ -670,7 +779,7 @@ def midtraining_checkpoint(
 
     This runs midtraining on RunPod:
     - Downloads base checkpoint from S3
-    - Downloads HuggingFace datasets (SmolTalk, MMLU, GSM8K, etc.)
+    - Downloads pre-serialized JSONL datasets from S3
     - Extends vocabulary for conversation tokens
     - Trains on conversational data
     - Uploads midtrained checkpoint to S3
@@ -749,7 +858,6 @@ def midtraining_checkpoint(
                 ),
                 "final_loss": checkpoint_metadata.get("final_loss"),
                 "min_val_loss": checkpoint_metadata.get("min_val_loss"),
-                "quick_mode": training_config["quick_mode"],
                 "pod_id": pod_id,
                 "execution_mode": "runpod",
                 "gpu_count": runpod.gpu_count,
@@ -768,12 +876,13 @@ def midtraining_checkpoint(
 
 
 @dg.asset(
+    deps=[raw_data],
     kinds={"huggingface", "s3"},
     group_name="supervised_fine_tuning",
 )
 def sft_datasets(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: SFTConfig,
     s3: S3Resource,
 ) -> dg.MaterializeResult:
     """
@@ -810,8 +919,9 @@ def sft_datasets(
     os.makedirs(SFT_DATASETS_CACHE, exist_ok=True)
 
     # Initialize datasets (triggers download if needed)
-    if config.quick_mode:
-        context.log.info("Quick mode: Loading small dataset subsets...")
+    # Use smaller datasets for $1 tier (max_seq_len == 512)
+    if config.max_seq_len == 512:
+        context.log.info("$1 tier: Loading small dataset subsets...")
         train_datasets = [
             ARC(subset="ARC-Easy", split="train", stop=50),  # 50 rows
             ARC(subset="ARC-Challenge", split="train", stop=30),  # 30 rows
@@ -827,7 +937,7 @@ def sft_datasets(
             SmolTalk(split="test", stop=100),  # 100 rows
         ]
     else:
-        context.log.info("Full mode: Loading complete datasets...")
+        context.log.info("$10/$100 tier: Loading complete datasets...")
         train_datasets = [
             ARC(subset="ARC-Easy", split="train"),  # 2.3K rows
             ARC(subset="ARC-Challenge", split="train"),  # 1.1K rows
@@ -916,7 +1026,7 @@ def sft_datasets(
 
     # Store metadata for reference
     dataset_info = {
-        "quick_mode": config.quick_mode,
+        "model_tag": config.model_tag,
         "train_size": train_size,
         "val_size": val_size,
         "num_train_datasets": len(train_datasets),
@@ -938,7 +1048,7 @@ def sft_datasets(
             "identity_s3_key": identity_s3_key,
             "train_size": train_size,
             "val_size": val_size,
-            "quick_mode": config.quick_mode,
+            "model_tag": config.model_tag,
             "num_train_datasets": len(train_datasets),
             "num_val_datasets": len(val_datasets),
             "s3_bucket": S3_BUCKET_NAME,
@@ -955,7 +1065,7 @@ def sft_datasets(
 )
 def sft_run_config(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: SFTConfig,
     s3: S3Resource,
 ) -> str:
     """
@@ -981,7 +1091,6 @@ def sft_run_config(
     # Build training configuration
     training_config = {
         "model_tag": model_tag,
-        "quick_mode": config.quick_mode,
         # Dataset paths (pre-processed on S3)
         "s3_bucket": S3_BUCKET_NAME,
         "s3_train_dataset_key": train_s3_key,
@@ -1030,12 +1139,12 @@ def sft_run_config(
         sft_datasets,
         nanochat_training_image,
     ],
-    kinds={"runpod", "s3", "Python"},
+    kinds={"runpod", "Python"},
     group_name="supervised_fine_tuning",
 )
 def sft_checkpoint(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: SFTConfig,
     sft_run_config: str,
     nanochat_training_image: str,
     runpod: RunPodResource,
@@ -1135,7 +1244,7 @@ def sft_checkpoint(
                 "training_time_seconds": training_time,
                 "final_train_loss": results.get("final_train_loss"),
                 "min_val_loss": results.get("min_val_loss"),
-                "quick_mode": config.quick_mode,
+                "model_tag": model_tag,
                 "s3_checkpoint_key": s3_output_key,
             }
         )
@@ -1168,7 +1277,7 @@ def nanochat_serverless_image(context: dg.AssetExecutionContext) -> str:
 )
 def serverless_endpoint(
     context: dg.AssetExecutionContext,
-    config: NanochatConfig,
+    config: SFTConfig,
     serverless: ServerlessResource,
     nanochat_serverless_image: str,
 ) -> str:

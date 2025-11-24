@@ -39,69 +39,81 @@ CONVERSATION_SPECIAL_TOKENS = [
 ]
 
 # =============================================================================
-# Unified Configuration
+# Stage-Specific Configurations
 # =============================================================================
 
 
-class NanochatConfig(dg.Config):
+class BaseTrainingConfig(dg.Config):
     """
-    Unified configuration for all nanochat training and inference assets.
+    Configuration for base model pretraining.
 
-    Different assets use different subsets of these parameters.
-    All parameters have sensible defaults for quick testing.
-
-    Asset usage guide:
-    - midtraining_checkpoint, sft_datasets: quick_mode
-    - base_model_checkpoint: quick_mode, depth, max_seq_len, num_iterations,
-      target_param_data_ratio, device_batch_size, total_batch_size, embedding_lr,
-      unembedding_lr, weight_decay, matrix_lr, grad_clip, warmup_ratio,
-      warmdown_ratio, final_lr_frac, eval_every, eval_tokens, sample_every, model_tag
-    - midtraining_checkpoint: quick_mode, model_tag, num_iterations, max_seq_len,
-      device_batch_size, total_batch_size, unembedding_lr, embedding_lr, matrix_lr,
-      init_lr_frac, weight_decay, eval_every, eval_tokens
-    - sft_checkpoint: model_tag, quick_mode, num_epochs, device_batch_size,
-      target_examples_per_step, unembedding_lr, embedding_lr, matrix_lr,
-      weight_decay, init_lr_frac, eval_every, eval_steps
+    Used by: model_run_config, base_model_checkpoint
     """
 
-    # === Global Settings ===
-    quick_mode: bool = True  # Fast GPU training mode: 4-layer model, reduced iterations (~5-10min on GPU)
-    model_tag: str = "d4"  # Model identifier (e.g., "d4", "d12", "d20")
+    model_tag: str = "d4"
+    depth: int = 4
+    max_seq_len: int = 1024
+    num_iterations: int = 50
+    target_param_data_ratio: int = 1
+    device_batch_size: int = 16
+    total_batch_size: int = 262144
+    embedding_lr: float = 0.2
+    unembedding_lr: float = 0.004
+    matrix_lr: float = 0.02
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    warmup_ratio: float = 0.0
+    warmdown_ratio: float = 0.2
+    final_lr_frac: float = 0.0
+    eval_every: int = 25
+    eval_tokens: int = 5 * 262144
+    sample_every: int = 50
 
-    # === Model Architecture (base training only) ===
-    depth: int = 12  # Transformer depth (set to 4 when quick_mode=True, 12 when quick_mode=False)
-    max_seq_len: int = 2048  # Maximum sequence length
 
-    # === Training Horizon ===
-    num_iterations: int = -1  # Number of iterations (-1 = auto-calculate)
-    target_param_data_ratio: int = 20  # Chinchilla optimal ratio
-    num_epochs: int = 1  # Number of epochs (SFT only)
+class MidtrainingConfig(dg.Config):
+    """
+    Configuration for midtraining.
 
-    # === Batch Sizes ===
-    device_batch_size: int = 32  # Per-device batch size
-    total_batch_size: int = 524288  # Total batch size in tokens
-    target_examples_per_step: int = 32  # Target examples per step (SFT only)
+    Used by: midtraining_run_config, midtraining_checkpoint
+    """
 
-    # === Learning Rates ===
-    embedding_lr: float = 0.2  # Learning rate for embeddings (Adam)
-    unembedding_lr: float = 0.004  # Learning rate for unembedding (Adam)
-    matrix_lr: float = 0.02  # Learning rate for matrices (Muon)
-    init_lr_frac: float = 1.0  # Initial LR fraction (mid/SFT only)
+    model_tag: str = "d4"
+    max_seq_len: int = 512
+    num_iterations: int = 50
+    device_batch_size: int = 1
+    total_batch_size: int = 512
+    embedding_lr: float = 0.2
+    unembedding_lr: float = 0.004
+    matrix_lr: float = 0.02
+    init_lr_frac: float = 1.0
+    weight_decay: float = 0.0
+    eval_every: int = 25
+    eval_tokens: int = 512
 
-    # === Regularization ===
-    weight_decay: float = 0.0  # Weight decay (Adam)
-    grad_clip: float = 1.0  # Gradient clipping (base training only)
 
-    # === Learning Rate Schedule (base training only) ===
-    warmup_ratio: float = 0.0  # LR warmup ratio
-    warmdown_ratio: float = 0.2  # LR warmdown ratio
-    final_lr_frac: float = 0.0  # Final LR fraction
+class SFTConfig(dg.Config):
+    """
+    Configuration for supervised fine-tuning.
 
-    # === Evaluation ===
-    eval_every: int = 250  # Evaluate every N steps
-    eval_tokens: int = 20 * 524288  # Tokens to use for validation
-    eval_steps: int = 100  # Eval steps (SFT only)
-    sample_every: int = 2000  # Sample from model every N steps (base only)
+    Used by: sft_datasets, sft_run_config, sft_checkpoint
+    """
+
+    model_tag: str = "d4"
+    max_seq_len: int = 512
+    num_epochs: int = 1
+    device_batch_size: int = 16
+    target_examples_per_step: int = 32
+    embedding_lr: float = 0.2
+    unembedding_lr: float = 0.004
+    matrix_lr: float = 0.02
+    init_lr_frac: float = 1.0
+    weight_decay: float = 0.0
+    eval_every: int = 25
+    eval_steps: int = 20
+
+
+# Backwards compatibility alias (for any existing code)
+NanochatConfig = BaseTrainingConfig
 
 
 class ChatInferenceConfig(dg.Config):

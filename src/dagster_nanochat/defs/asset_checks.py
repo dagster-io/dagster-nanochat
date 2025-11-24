@@ -1,6 +1,5 @@
 import json
 import os
-import time
 
 import dagster as dg
 import tiktoken
@@ -16,27 +15,6 @@ from dagster_nanochat.nanochat.chat_eval import run_chat_eval
 from dagster_nanochat.nanochat.engine import Engine
 from dagster_nanochat.nanochat.gpt import GPT, GPTConfig
 from dagster_nanochat.utils.tokenizer_utils import create_tokenizer_with_special_tokens
-
-# Canonical tokenizer file path
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-
-def _get_canonical_tokenizer_file() -> str | None:
-    """
-    Get the canonical tokenizer file path.
-
-    Returns:
-        Path to tokenizer.json, or None if not found
-    """
-    tokenizer_path = os.path.abspath(TOKENIZER_FILE)
-    if os.path.exists(tokenizer_path):
-        return tokenizer_path
-    return None
-
 
 # =============================================================================
 # Evaluation Texts
@@ -66,7 +44,7 @@ def tokenizer_file_valid(
     """Check that the canonical tokenizer file exists and is valid."""
 
     # Get the canonical tokenizer file
-    tokenizer_path = _get_canonical_tokenizer_file()
+    tokenizer_path = os.path.abspath(TOKENIZER_FILE)
 
     if tokenizer_path is None:
         return dg.AssetCheckResult(
@@ -139,7 +117,7 @@ def tokenizer_encode_decode(
     """Check that the canonical tokenizer can encode and decode text correctly."""
 
     # Get the canonical tokenizer file
-    tokenizer_path = _get_canonical_tokenizer_file()
+    tokenizer_path = os.path.abspath(TOKENIZER_FILE)
 
     if tokenizer_path is None:
         return dg.AssetCheckResult(
@@ -210,7 +188,7 @@ def tokenizer_compression_ratio(
     """Evaluate tokenizer compression ratio on sample texts."""
 
     # Get the canonical tokenizer file
-    tokenizer_path = _get_canonical_tokenizer_file()
+    tokenizer_path = os.path.abspath(TOKENIZER_FILE)
 
     if tokenizer_path is None:
         return dg.AssetCheckResult(
@@ -303,7 +281,7 @@ def _compare_tokenizer_vs_gpt2_single_text(
         AssetCheckResult with comparison metrics
     """
     # Get the canonical tokenizer file
-    tokenizer_path = _get_canonical_tokenizer_file()
+    tokenizer_path = os.path.abspath(TOKENIZER_FILE)
 
     if tokenizer_path is None:
         return dg.AssetCheckResult(

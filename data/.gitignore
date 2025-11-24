@@ -3,6 +3,7 @@
 
 # Tokenizer and checkpoint files
 *.json
+*.jsonl
 *.pt
 
 # But keep identity conversations for SFT

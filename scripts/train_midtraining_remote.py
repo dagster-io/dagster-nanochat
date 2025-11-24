@@ -4,7 +4,7 @@ Midtraining script for RunPod GPU execution.
 This script:
 1. Downloads config, base checkpoint, and tokenizer from S3
 2. Loads and extends base model for conversation tokens
-3. Downloads HuggingFace datasets (SmolTalk, MMLU, GSM8K, etc.)
+3. Downloads pre-serialized JSONL datasets from S3
 4. Trains on conversational data
 5. Uploads midtrained checkpoint to S3
 """
@@ -21,25 +21,11 @@ import boto3
 import torch
 import torch.distributed as dist
 
-# Suppress verbose logging from HuggingFace and httpx
-logging.getLogger("datasets").setLevel(logging.ERROR)
-logging.getLogger("httpx").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
-os.environ["HF_DATASETS_VERBOSITY"] = "error"
-
-# Disable progress bars
-import datasets
-
-datasets.disable_progress_bar()
 
 from dagster_nanochat.defs.config import CONVERSATION_SPECIAL_TOKENS
 from dagster_nanochat.nanochat.common import get_dist_info, print0
 from dagster_nanochat.nanochat.gpt import GPT, GPTConfig
-from dagster_nanochat.tasks.common import TaskMixture
-from dagster_nanochat.tasks.gsm8k import GSM8K
-from dagster_nanochat.tasks.mmlu import MMLU
-from dagster_nanochat.tasks.smoltalk import SmolTalk
-from dagster_nanochat.tasks.spellingbee import SimpleSpelling, SpellingBee
 from dagster_nanochat.utils.data_generators import create_midtraining_data_generator
 from dagster_nanochat.utils.model_utils import extend_model_vocab_for_special_tokens
 from dagster_nanochat.utils.tokenizer_utils import create_tokenizer_with_special_tokens
@@ -69,53 +55,44 @@ def upload_to_s3(s3_client, local_path, bucket, key):
     print0(f"Uploaded from: {local_path}", flush=True)
 
 
-def download_datasets(dataset_specs):
-    """Download HuggingFace datasets based on specifications.
+def load_jsonl_datasets(s3_client, bucket, train_key, val_key):
+    """Load pre-serialized JSONL datasets from S3.
 
     Args:
-        dataset_specs: Dict with "train" and "val" keys, each containing list of dataset specs
+        s3_client: boto3 S3 client
+        bucket: S3 bucket name
+        train_key: S3 key for training dataset
+        val_key: S3 key for validation dataset
 
     Returns:
-        Tuple of (train_dataset, val_dataset) TaskMixture objects
+        Tuple of (train_dataset, val_dataset) as lists of conversations
     """
-    print0("Downloading training datasets from HuggingFace...")
+    print0("Loading pre-serialized datasets from S3...")
 
-    # Map class names to actual classes
-    class_map = {
-        "SmolTalk": SmolTalk,
-        "MMLU": MMLU,
-        "GSM8K": GSM8K,
-        "SimpleSpelling": SimpleSpelling,
-        "SpellingBee": SpellingBee,
-    }
+    # Download train dataset
+    train_path = "train_dataset.jsonl"
+    print0(f"Downloading train dataset: s3://{bucket}/{train_key}")
+    download_from_s3(s3_client, bucket, train_key, train_path)
 
-    # Load training datasets
-    train_datasets = []
-    for spec in dataset_specs["train"]:
-        class_name = spec["class"]
-        kwargs = spec["kwargs"]
-        dataset_class = class_map[class_name]
-        print0(f"   Loading {class_name}({kwargs})...")
-        dataset = dataset_class(**kwargs)
-        train_datasets.append(dataset)
-        print0(f"   {class_name}: {len(dataset)} examples")
-
-    # Load validation datasets
-    val_datasets = []
-    for spec in dataset_specs["val"]:
-        class_name = spec["class"]
-        kwargs = spec["kwargs"]
-        dataset_class = class_map[class_name]
-        print0(f"   Loading {class_name}({kwargs})...")
-        dataset = dataset_class(**kwargs)
-        val_datasets.append(dataset)
-        print0(f"   {class_name}: {len(dataset)} examples")
-
-    # Create task mixtures
-    train_dataset = TaskMixture(train_datasets)
-    val_dataset = TaskMixture(val_datasets)
+    train_dataset = []
+    with open(train_path, "r") as f:
+        for line in f:
+            conversation = json.loads(line)
+            train_dataset.append(conversation)
 
     print0(f"Training dataset: {len(train_dataset):,} examples")
+
+    # Download val dataset
+    val_path = "val_dataset.jsonl"
+    print0(f"Downloading val dataset: s3://{bucket}/{val_key}")
+    download_from_s3(s3_client, bucket, val_key, val_path)
+
+    val_dataset = []
+    with open(val_path, "r") as f:
+        for line in f:
+            conversation = json.loads(line)
+            val_dataset.append(conversation)
+
     print0(f"Validation dataset: {len(val_dataset):,} examples")
 
     return train_dataset, val_dataset
@@ -159,7 +136,8 @@ def main():
     print0(f"Config: {json.dumps(config, indent=2)}", flush=True)
 
     # Extract config parameters
-    dataset_specs = config["dataset_specs"]
+    s3_train_dataset_key = config["s3_train_dataset_key"]
+    s3_val_dataset_key = config["s3_val_dataset_key"]
     max_seq_len = config["max_seq_len"]
     device_batch_size = config["device_batch_size"]
     total_batch_size = config["total_batch_size"]
@@ -252,8 +230,10 @@ def main():
     tokenizer = create_tokenizer_with_special_tokens(tokenizer_data, base_vocab_size)
     print0("Tokenizer loaded with special tokens", flush=True)
 
-    # Download and load datasets
-    train_dataset, val_dataset = download_datasets(dataset_specs)
+    # Load pre-serialized datasets from S3
+    train_dataset, val_dataset = load_jsonl_datasets(
+        s3_client, args.s3_bucket, s3_train_dataset_key, s3_val_dataset_key
+    )
 
     # Setup optimizers
     print0("Setting up optimizers...", flush=True)
@@ -425,7 +405,6 @@ def main():
                 "device_batch_size": device_batch_size,
                 "total_batch_size": total_batch_size,
                 "num_iterations": num_iterations,
-                "quick_mode": config["quick_mode"],
                 "train_dataset_size": len(train_dataset),
                 "val_dataset_size": len(val_dataset),
                 "base_vocab_size": base_vocab_size,
