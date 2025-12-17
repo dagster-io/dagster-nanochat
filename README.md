@@ -4,9 +4,11 @@ A production-grade Dagster pipeline for training language models from scratch—
 
 ## Blogs
 
-[Part 1 - Orchestrating Nanochat: Building the Tokenizer](https://dagster.io/blog/orchestrating-nanochat-building-the-tokenizer)
-[Part 2 - Orchestrating Nanochat: Training the Models](https://dagster.io/blog/orchestrating-nanochat-training-the-models)
-[Part 3 - Orchestrating Nanochat: Deploying the Model](https://dagster.io/blog/orchestrating-nanochat-deploying-the-model)
+* [Part 1 - Orchestrating Nanochat: Building the Tokenizer](https://dagster.io/blog/orchestrating-nanochat-building-the-tokenizer)
+
+* [Part 2 - Orchestrating Nanochat: Training the Models](https://dagster.io/blog/orchestrating-nanochat-training-the-models)
+
+* [Part 3 - Orchestrating Nanochat: Deploying the Model](https://dagster.io/blog/orchestrating-nanochat-deploying-the-model)
 
 ## What is This?
 
