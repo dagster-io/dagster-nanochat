@@ -2,6 +2,12 @@
 
 A production-grade Dagster pipeline for training language models from scratch—from raw text to conversational AI.
 
+## Blogs
+
+[Part 1 - Orchestrating Nanochat: Building the Tokenizer](https://dagster.io/blog/orchestrating-nanochat-building-the-tokenizer)
+[Part 2 - Orchestrating Nanochat: Training the Models](https://dagster.io/blog/orchestrating-nanochat-training-the-models)
+[Part 3 - Orchestrating Nanochat: Deploying the Model](https://dagster.io/blog/orchestrating-nanochat-deploying-the-model)
+
 ## What is This?
 
 This project demonstrates how to build a complete LLM training pipeline using Dagster as the orchestration layer. Starting with the FineWeb-Edu dataset, it trains a GPT-style model through six distinct stages:
